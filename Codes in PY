@@ -1,0 +1,98 @@
+import time
+import json 
+from lnmarkets import rest
+
+API_KEY = " "
+API_SECRET = " "
+PASSPHRASE = " "
+NETWORK = " "
+
+options = {
+    'key': API_KEY, 
+    'secret': API_SECRET, 
+    'passphrase': PASSPHRASE,
+    'network': NETWORK
+}
+lnm = rest.LNMarketsRest(**options)
+
+def run_bot():
+    while True:
+        try:
+            print("---")
+            print(f"[{time.ctime()}] Checking positions...")
+            
+            positions_raw = lnm.futures_get_trades({'type': 'running'})
+            
+            if isinstance(positions_raw, str):
+                positions = json.loads(positions_raw)
+            elif isinstance(positions_raw, dict) and 'message' in positions_raw:
+                print(f"❌ Error getting positions: {positions_raw['message']}")
+                time.sleep(5)
+                continue
+            else:
+                positions = positions_raw
+            
+            if not positions:
+                print("ℹ️ No open positions found.")
+                time.sleep(5) 
+                continue
+
+            ticker_data_raw = lnm.futures_get_ticker()
+
+            if isinstance(ticker_data_raw, str):
+                ticker_data = json.loads(ticker_data_raw)
+            elif isinstance(ticker_data_raw, dict) and 'message' in ticker_data_raw:
+                print(f"❌ Error getting ticker price: {ticker_data_raw['message']}")
+                time.sleep(5)
+                continue
+            else:
+                ticker_data = ticker_data_raw
+
+            current_price = ticker_data.get('lastPrice')
+            print(f"📊 Current Market Price: {current_price}")
+
+            for position in positions:
+                liquidation_price = position.get('liquidation')
+                safety_margin_percentage = 0.05
+                
+                if position.get('side') == 'b':
+                    distance_to_liquidation = (current_price - liquidation_price) / current_price
+                elif position.get('side') == 's':
+                    distance_to_liquidation = (liquidation_price - current_price) / current_price
+                else:
+                    distance_to_liquidation = float('inf')
+
+                print("\n---")
+                print(f"✨ **Position ID:** {position.get('id')}")
+                print(f"**Type:** {'LONG' if position.get('side') == 'b' else 'SHORT'}")
+                print(f"**Liquidation Price:** {liquidation_price}")
+                print(f"**Distance to Liquidation:** {distance_to_liquidation:.2%}")
+
+                if distance_to_liquidation < safety_margin_percentage:
+                    print("⚠️ Alert! Price is getting dangerously close to the liquidation point.")
+                    print("💰 Adding margin to protect the position...")
+                    
+                    trade_id = position.get('id')
+                    margin_amount = 5000
+                    
+                    lnm.futures_add_margin({
+                        'amount': margin_amount,
+                        'id': trade_id
+                    })
+
+                    print(f"✅ Margin of {margin_amount} satoshis successfully added to position {trade_id}.")
+                else:
+                    print("✅ Position is safe. No need to add margin and Mat is delicious.")
+            
+            print("\n---")
+            print(f"✔️ All positions checked. Next check in 5 seconds.")
+            print("---")
+            time.sleep(5)
+
+        except Exception as e:
+            print(f"\n❌ An unexpected error occurred: {e}")
+            print("Waiting 30 seconds before trying again...")
+            time.sleep(30)
+
+if __name__ == "__main__":
+    run_bot()
