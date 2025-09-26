@@ -19,26 +19,23 @@ Remote Control: Manage the bot (Pause/Resume, Status) using inline buttons in th
 
 Configuration: Change strategy parameters (like BUY_DROP_AMOUNT, MAX_POSITIONS, etc.) directly via Telegram.
 
-Quick Setup
-1. Prerequisites
+Quick Setup:
+Prerequisites
 Python 3.x
 An active LN Markets account.
 A Telegram bot (create one using BotFather).
 
-# Install dependencies
+
+Install dependencies
 pip install ln-markets requests urllib3
 
-# In bot_with_telegram.py (replace with your values)
-# ----------------------------
-# 1. CONFIGURATION AND STATE
-# ----------------------------
-# --- LN Markets Credentials ---
+
 API_KEY = "YOUR_API_KEY"
 API_SECRET = "YOUR_API_SECRET"
 PASSPHRASE = "YOUR_PASSPHRASE"
-NETWORK = "mainnet" # or "testnet"
+NETWORK = "mainnet" or "testnet"
 
-# --- Telegram Credentials ---
+Telegram Credentials 
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"
-DEFAULT_TELEGRAM_CHAT_ID = 123456789 # Your chat or group ID
+DEFAULT_TELEGRAM_CHAT_ID = 123456789 Your chat or group ID
 
