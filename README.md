@@ -1,6 +1,8 @@
+LN Markets Telegram Trading Bot
+
 This is an automated Python trading bot designed for the LN Markets Futures platform. It implements a DCA (Dollar-Cost Averaging) strategy on price dips and features full Telegram integration for real-time monitoring, critical alerts, and remote configuration management.
 
-✨ Key Features
+Key Features
 DCA Strategy: Opens new Long positions in the futures market when the price drops by a predefined amount from its recent peak.
 
 Risk Management (Guardian Angel): Actively monitors open positions and automatically adds safety margin if the liquidation price gets too close.
@@ -17,17 +19,11 @@ Remote Control: Manage the bot (Pause/Resume, Status) using inline buttons in th
 
 Configuration: Change strategy parameters (like BUY_DROP_AMOUNT, MAX_POSITIONS, etc.) directly via Telegram.
 
-🚀 Quick Setup
+Quick Setup
 1. Prerequisites
 Python 3.x
-
 An active LN Markets account.
-
 A Telegram bot (create one using BotFather).
-
-# Clone this repository
-git clone [YOUR_REPOSITORY_HERE]
-cd [YOUR_REPOSITORY_HERE]
 
 # Install dependencies
 pip install ln-markets requests urllib3
