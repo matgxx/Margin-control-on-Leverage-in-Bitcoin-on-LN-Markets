@@ -1,98 +1,533 @@
+"""
+File: bot_with_telegram.py
+Description: Trading bot (LN Markets) integrated with Telegram.
+Added Features:
+ - Sends notifications to Telegram about buys, sells, margin additions, and periodic reports.
+ - Inline buttons: "Get Status", "Pause/Resume Bot", "Configuration".
+ - Simple chat-based configuration flow (select parameter -> send new value).
+ - Telegram update listener via polling (separate thread).
+
+How to use:
+ 1) Install dependencies: pip install ln-markets requests
+ 2) Place your keys (already present at the top if you provided them).
+ 3) Run: python bot_with_telegram.py
+
+ATTENTION: Keys (API_KEY, API_SECRET, TELEGRAM_BOT_TOKEN) are in this file while running.
+Protect the file and do not share publicly.
+"""
+
 import time
-import json 
+import json
+import sys
+import threading
+from datetime import datetime
+import urllib3
+import ssl
+import requests
 from lnmarkets import rest
 
+# ----------------------------
+# 1. CONFIGURATION AND STATE
+# ----------------------------
+# --- Credentials ---
 API_KEY = " "
 API_SECRET = " "
 PASSPHRASE = " "
-NETWORK = " "
+NETWORK = "mainnet"
 
-options = {
-    'key': API_KEY, 
-    'secret': API_SECRET, 
-    'passphrase': PASSPHRASE,
-    'network': NETWORK
+TELEGRAM_BOT_TOKEN = " "
+DEFAULT_TELEGRAM_CHAT_ID = 
+
+# --- Strategy Parameters (Editable) ---
+STRATEGY_CONFIG = {
+    "BUY_DROP_AMOUNT": 1500, # Price drop amount in USD to trigger a buy
+    "BUY_AMOUNT_SATS": 5000, # Margin amount in sats for each trade
+    "MAX_POSITIONS": 5, # Maximum number of open positions
+    "LEVERAGE": 15,
+    "TAKE_PROFIT_PERCENTAGE": 0.30, # % gain on margin before closing
+    "LOG_INTERVAL_MINUTES": 60, # Interval for periodic status reports
+    "ADD_MARGIN_SATS": 5000, # Amount of sats to add as margin when triggered
+    "SAFETY_MARGIN_PERCENT": 0.05, # Distance to liquidation price (% of current price) to trigger margin add
+    "MARGIN_COOLDOWN_MINUTES": 5, # Cooldown to prevent spamming margin adds
 }
-lnm = rest.LNMarketsRest(**options)
+config_lock = threading.Lock() # Lock for accessing strategy config
 
-def run_bot():
+# --- Internal Bot State ---
+lnm = None # LNMarkets REST client instance
+last_peak_price = None # Highest price reached since last buy or bot start
+last_buy_price = None # Price of the last opened position
+is_paused = False # Bot pause state
+pause_lock = threading.Lock()
+
+is_trade_attempt_locked = False # Flag to prevent rapid trade attempts
+trade_attempt_lock = threading.Lock()
+TRADE_ATTEMPT_COOLDOWN_SECONDS = 180 # Cooldown after a trade attempt (success or failure)
+
+last_margin_add_time = {} # Tracks the last time margin was added for each position
+margin_time_lock = threading.Lock()
+
+# For Telegram configuration interactions
+pending_config = {}  # chat_id -> param_name (waiting for new value)
+pending_lock = threading.Lock()
+
+# Telegram polling offset
+tg_update_offset = None
+offset_lock = threading.Lock()
+
+# ----------------------------
+# 2. HELPER FUNCTIONS
+# ----------------------------
+
+def log_message(message, level="INFO"):
+    """Logs messages locally to console and file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] [{level.upper()}] {message}"
+    print(log_entry)
+    with open("bot_log.txt", "a", encoding='utf-8') as f:
+        f.write(log_entry + "\n")
+
+# ----------------------------
+# 3. TELEGRAM INTEGRATION
+# ----------------------------
+
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+def tg_send_message(chat_id, text, reply_markup=None, parse_mode='HTML'):
+    """Sends a message to a Telegram chat."""
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        r = requests.post(f"{TELEGRAM_API_URL}/sendMessage", data=payload, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log_message(f"Error sending Telegram message: {e}", "ERROR")
+        return None
+
+
+def tg_answer_callback(callback_id, text=None):
+    """Answers a Telegram callback query (removes loading state)."""
+    try:
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        requests.post(f"{TELEGRAM_API_URL}/answerCallbackQuery", data=payload, timeout=5)
+    except Exception as e:
+        log_message(f"Error answering Telegram callback: {e}", "ERROR")
+
+
+def build_main_keyboard():
+    """Builds the main inline keyboard menu."""
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "📊 Get Status", "callback_data": "status"}],
+            [{"text": "⏸️ Pause/Resume Bot", "callback_data": "toggle_pause"}],
+            [{"text": "⚙️ Configuration", "callback_data": "config_menu"}]
+        ]
+    }
+    return keyboard
+
+
+def build_config_keyboard():
+    """Builds the inline keyboard for config parameters."""
+    with config_lock:
+        keys = list(STRATEGY_CONFIG.keys())
+    keyboard = {"inline_keyboard": []}
+    for k in keys:
+        keyboard["inline_keyboard"].append([{"text": f"{k}: {STRATEGY_CONFIG[k]}", "callback_data": f"config|{k}"}])
+    keyboard["inline_keyboard"].append([{"text": "⬅️ Back", "callback_data": "main"}])
+    return keyboard
+
+# ----------------------------
+# 4. REPORT GENERATION
+# ----------------------------
+
+def get_api_data(func, *args, **kwargs):
+    """Wrapper to handle LNMarkets API calls and error handling."""
+    try:
+        data_raw = func(*args, **kwargs)
+        if isinstance(data_raw, str) and data_raw:
+            return json.loads(data_raw)
+        return data_raw if data_raw is not None else {}
+    except Exception as e:
+        log_message(f"API call error for '{func.__name__}': {e}", "ERROR")
+        return None
+
+
+def generate_summary_message_html():
+    """Generates the bot status report in HTML format for Telegram."""
+    user_data = get_api_data(lnm.get_user)
+    ticker_data = get_api_data(lnm.futures_get_ticker)
+    running_positions = get_api_data(lnm.futures_get_trades, {"type": "running"}) or []
+
+    account_balance_sats = user_data.get('balance', 0) if user_data else 0
+    current_price = ticker_data.get('lastPrice') if ticker_data else None
+
+    with config_lock:
+        buy_drop = STRATEGY_CONFIG["BUY_DROP_AMOUNT"]
+        max_pos = STRATEGY_CONFIG["MAX_POSITIONS"]
+
+    base_price_for_drop = last_buy_price or last_peak_price
+    if base_price_for_drop:
+        next_buy_trigger_val = base_price_for_drop - buy_drop
+        next_buy_trigger = f"~${next_buy_trigger_val:,.2f}"
+    else:
+        next_buy_trigger = "Waiting..."
+
+    status_bot = "▶️ <b>ACTIVE</b>" if not is_paused else "⏸️ <b>PAUSED</b>"
+
+    lines = []
+    lines.append("<b>Status Report</b>\n")
+    lines.append(f"Status: {status_bot}")
+    lines.append(f"Balance: {account_balance_sats:,} sats")
+    lines.append(f"Current Price: ${current_price:,.2f}" if current_price else "Current Price: N/A")
+    lines.append(f"Strategy Peak: ${last_peak_price:,.2f}" if last_peak_price else "Strategy Peak: N/A")
+    lines.append(f"Last Buy: ${last_buy_price:,.2f}" if last_buy_price else "Last Buy: N/A")
+    lines.append(f"Next Trigger: {next_buy_trigger}")
+    lines.append(f"Positions: {len(running_positions)} / {max_pos}")
+
+    return "\n".join(lines)
+
+# ----------------------------
+# 5. TELEGRAM LISTENER (polling)
+# ----------------------------
+
+def tg_get_updates(offset=None, timeout=10):
+    """Polls Telegram API for new updates."""
+    params = {"timeout": timeout}
+    if offset:
+        params["offset"] = offset
+    try:
+        r = requests.get(f"{TELEGRAM_API_URL}/getUpdates", params=params, timeout=timeout+5)
+        r.raise_for_status()
+        return r.json().get('result', [])
+    except Exception as e:
+        log_message(f"Error fetching Telegram updates: {e}", "ERROR")
+        return []
+
+
+def process_callback(callback_query):
+    """Handles inline button presses."""
+    callback_id = callback_query.get('id')
+    data = callback_query.get('data')
+    chat_id = callback_query['message']['chat']['id'] if callback_query.get('message') else callback_query['from']['id']
+
+    if data == 'status':
+        msg = generate_summary_message_html()
+        tg_send_message(chat_id, msg, reply_markup=build_main_keyboard())
+        tg_answer_callback(callback_id)
+        return
+
+    if data == 'toggle_pause':
+        global is_paused
+        with pause_lock:
+            is_paused = not is_paused
+        state = 'PAUSED' if is_paused else 'ACTIVE'
+        tg_send_message(chat_id, f"Bot is now: <b>{state}</b>", reply_markup=build_main_keyboard())
+        tg_answer_callback(callback_id)
+        return
+
+    if data == 'config_menu':
+        tg_send_message(chat_id, "Choose the parameter you want to change:", reply_markup=build_config_keyboard())
+        tg_answer_callback(callback_id)
+        return
+
+    if data.startswith('config|'):
+        _, param = data.split('|', 1)
+        with pending_lock:
+            pending_config[chat_id] = param
+        tg_send_message(chat_id, f"Send the new value for <b>{param}</b>. (numbers or float only)")
+        tg_answer_callback(callback_id)
+        return
+
+    if data == 'main':
+        tg_send_message(chat_id, "Main menu:", reply_markup=build_main_keyboard())
+        tg_answer_callback(callback_id)
+        return
+
+
+def process_message(message):
+    """Handles text messages from Telegram."""
+    chat_id = message['chat']['id']
+    text = message.get('text', '').strip()
+
+    # Check if waiting for a config value
+    with pending_lock:
+        param = pending_config.get(chat_id)
+
+    if param:
+        # Tries to convert the value
+        try:
+            if '.' in text:
+                new_val = float(text)
+            else:
+                new_val = int(text)
+            with config_lock:
+                # Maintains consistent types
+                STRATEGY_CONFIG[param] = new_val
+            tg_send_message(chat_id, f"Parameter <b>{param}</b> updated to <b>{new_val}</b>", reply_markup=build_main_keyboard())
+            with pending_lock:
+                pending_config.pop(chat_id, None)
+            log_message(f"Config updated via Telegram: {param} = {new_val}", "INFO")
+        except Exception as e:
+            tg_send_message(chat_id, "Invalid value. Send a number (e.g., 1500 or 0.05)")
+        return
+
+    # Direct commands
+    if text.lower().startswith('/status'):
+        tg_send_message(chat_id, generate_summary_message_html(), reply_markup=build_main_keyboard())
+        return
+    if text.lower().startswith('/pause'):
+        global is_paused
+        with pause_lock:
+            is_paused = True
+        tg_send_message(chat_id, "Bot paused ✅", reply_markup=build_main_keyboard())
+        return
+    if text.lower().startswith('/resume'):
+        with pause_lock:
+            is_paused = False
+        tg_send_message(chat_id, "Bot resumed ✅", reply_markup=build_main_keyboard())
+        return
+
+    # Default case
+    tg_send_message(chat_id, "Use the buttons below or /status for the report.", reply_markup=build_main_keyboard())
+
+
+def tg_listener_thread():
+    """Main loop for listening to Telegram updates (polling)."""
+    global tg_update_offset
+    log_message("Telegram Listener thread started.", "INFO")
     while True:
         try:
-            print("---")
-            print(f"[{time.ctime()}] Checking positions...")
-            
-            positions_raw = lnm.futures_get_trades({'type': 'running'})
-            
-            if isinstance(positions_raw, str):
-                positions = json.loads(positions_raw)
-            elif isinstance(positions_raw, dict) and 'message' in positions_raw:
-                print(f"❌ Error getting positions: {positions_raw['message']}")
-                time.sleep(5)
-                continue
-            else:
-                positions = positions_raw
-            
-            if not positions:
-                print("ℹ️ No open positions found.")
-                time.sleep(5) 
-                continue
-
-            ticker_data_raw = lnm.futures_get_ticker()
-
-            if isinstance(ticker_data_raw, str):
-                ticker_data = json.loads(ticker_data_raw)
-            elif isinstance(ticker_data_raw, dict) and 'message' in ticker_data_raw:
-                print(f"❌ Error getting ticker price: {ticker_data_raw['message']}")
-                time.sleep(5)
-                continue
-            else:
-                ticker_data = ticker_data_raw
-
-            current_price = ticker_data.get('lastPrice')
-            print(f"📊 Current Market Price: {current_price}")
-
-            for position in positions:
-                liquidation_price = position.get('liquidation')
-                safety_margin_percentage = 0.05
-                
-                if position.get('side') == 'b':
-                    distance_to_liquidation = (current_price - liquidation_price) / current_price
-                elif position.get('side') == 's':
-                    distance_to_liquidation = (liquidation_price - current_price) / current_price
-                else:
-                    distance_to_liquidation = float('inf')
-
-                print("\n---")
-                print(f"✨ **Position ID:** {position.get('id')}")
-                print(f"**Type:** {'LONG' if position.get('side') == 'b' else 'SHORT'}")
-                print(f"**Liquidation Price:** {liquidation_price}")
-                print(f"**Distance to Liquidation:** {distance_to_liquidation:.2%}")
-
-                if distance_to_liquidation < safety_margin_percentage:
-                    print("⚠️ Alert! Price is getting dangerously close to the liquidation point.")
-                    print("💰 Adding margin to protect the position...")
-                    
-                    trade_id = position.get('id')
-                    margin_amount = 5000
-                    
-                    lnm.futures_add_margin({
-                        'amount': margin_amount,
-                        'id': trade_id
-                    })
-
-                    print(f"✅ Margin of {margin_amount} satoshis successfully added to position {trade_id}.")
-                else:
-                    print("✅ Position is safe. No need to add margin and Mat is delicious.")
-            
-            print("\n---")
-            print(f"✔️ All positions checked. Next check in 5 seconds.")
-            print("---")
+            with offset_lock:
+                offs = tg_update_offset
+            updates = tg_get_updates(offset=offs, timeout=30)
+            for up in updates:
+                with offset_lock:
+                    tg_update_offset = up['update_id'] + 1
+                if 'callback_query' in up:
+                    process_callback(up['callback_query'])
+                elif 'message' in up:
+                    process_message(up['message'])
+        except Exception as e:
+            log_message(f"Error in Telegram listener: {e}", "ERROR")
             time.sleep(5)
 
-        except Exception as e:
-            print(f"\n❌ An unexpected error occurred: {e}")
-            print("Waiting 30 seconds before trying again...")
-            time.sleep(30)
+# ----------------------------
+# 6. INTEGRATION WITH BOT LOOP
+# ----------------------------
 
+def send_status_periodic(chat_id=DEFAULT_TELEGRAM_CHAT_ID):
+    """Sends the summary every LOG_INTERVAL_MINUTES (configurable)."""
+    while True:
+        with config_lock:
+            interval = STRATEGY_CONFIG.get('LOG_INTERVAL_MINUTES', 60)
+        try:
+            msg = generate_summary_message_html()
+            tg_send_message(chat_id, msg, reply_markup=build_main_keyboard())
+        except Exception as e:
+            log_message(f"Error sending periodic status: {e}", "ERROR")
+        time.sleep(max(30, interval * 60))
+
+# ----------------------------
+# 7. MAIN BOT LOOP (modified to send Telegram notifications)
+# ----------------------------
+
+def reset_trade_lock():
+    """Resets the trade attempt lock."""
+    global is_trade_attempt_locked
+    with trade_attempt_lock:
+        is_trade_attempt_locked = False
+    log_message('Trade attempt lock released.', 'INFO')
+
+
+def run_bot_trader():
+    """The main trading strategy loop."""
+    global last_peak_price, last_buy_price, is_trade_attempt_locked
+
+    log_message("Bot Trader Started! Connected and monitoring.", "SUCCESS")
+    # Notify startup
+    tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, "✅ Bot started and connected.", reply_markup=build_main_keyboard())
+
+    try:
+        initial_ticker = get_api_data(lnm.futures_get_ticker)
+        initial_price = initial_ticker.get('lastPrice') if initial_ticker else None
+        if initial_price:
+            last_peak_price = initial_price
+            initial_summary = "Initial Status Report\n\n" + generate_summary_message_html()
+            log_message(initial_summary, "SUMMARY")
+            tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, initial_summary, reply_markup=build_main_keyboard())
+        else:
+            log_message("Could not get initial price", "ERROR")
+    except Exception as e:
+        log_message(f"Error generating initial report: {e}", "ERROR")
+
+    last_log_time = time.time()
+    last_positions_count = len(get_api_data(lnm.futures_get_trades, {"type": "running"}) or [])
+
+    while True:
+        try:
+            with pause_lock: is_bot_paused = is_paused
+            with trade_attempt_lock: is_locked = is_trade_attempt_locked
+
+            with config_lock:
+                buy_drop_amount = STRATEGY_CONFIG["BUY_DROP_AMOUNT"]
+                buy_amount_sats = STRATEGY_CONFIG["BUY_AMOUNT_SATS"]
+                max_positions = STRATEGY_CONFIG["MAX_POSITIONS"]
+                leverage = STRATEGY_CONFIG["LEVERAGE"]
+                tp_percentage = STRATEGY_CONFIG["TAKE_PROFIT_PERCENTAGE"]
+                log_interval = STRATEGY_CONFIG["LOG_INTERVAL_MINUTES"]
+                add_margin_amount = STRATEGY_CONFIG["ADD_MARGIN_SATS"]
+                safety_margin_trigger = STRATEGY_CONFIG["SAFETY_MARGIN_PERCENT"]
+                margin_cooldown = STRATEGY_CONFIG["MARGIN_COOLDOWN_MINUTES"]
+
+            ticker_data = get_api_data(lnm.futures_get_ticker)
+            current_price = ticker_data.get('lastPrice') if ticker_data else None
+            if not current_price:
+                time.sleep(5)
+                continue
+
+            # Update peak price
+            if last_peak_price is None or current_price > last_peak_price:
+                last_peak_price = current_price
+
+            running_positions = get_api_data(lnm.futures_get_trades, {"type": "running"}) or []
+            current_positions_count = len(running_positions)
+
+            # Check for closed positions
+            if current_positions_count < last_positions_count:
+                msg = f"Position Closed! Current positions: {current_positions_count}"
+                log_message(msg, "SUCCESS")
+                tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, msg)
+            last_positions_count = current_positions_count
+
+            # --- MARGIN ADDITION LOGIC (GUARDIAN ANGEL) ---
+            current_time = time.time()
+
+            for pos in running_positions:
+                pos_id = pos.get('id')
+                liq_price = pos.get('liquidation')
+                if not liq_price:
+                    continue
+
+                with margin_time_lock:
+                    last_add_time = last_margin_add_time.get(pos_id, 0)
+                    can_add_margin = (current_time - last_add_time) >= (margin_cooldown * 60)
+
+                if not can_add_margin:
+                    continue
+
+                distance_to_liq = abs(current_price - liq_price) / current_price
+
+                if distance_to_liq < safety_margin_trigger:
+                    alert_msg = f"LIQUIDATION ALERT! Position {pos_id} is {distance_to_liq:.2%} from liquidation price (${liq_price:,.2f}). Adding {add_margin_amount:,} sats..."
+                    log_message(alert_msg, "CRITICAL")
+                    tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, alert_msg)
+                    try:
+                        params = {'amount': add_margin_amount, 'id': pos_id}
+                        res = get_api_data(lnm.futures_add_margin, params)
+
+                        if res:
+                            success_msg = f"Margin of {add_margin_amount:,} sats successfully added to position {pos_id}!"
+                            log_message(success_msg, "SUCCESS")
+                            tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, success_msg)
+                            with margin_time_lock:
+                                last_margin_add_time[pos_id] = current_time
+                        else:
+                            log_message(f"Failed to add margin to position {pos_id}. API Response: {res}", "ERROR")
+                            tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, f"Failed to add margin to position {pos_id}. API Response: {res}")
+
+                    except Exception as e:
+                        log_message(f"Critical error trying to add margin: {e}", "CRITICAL")
+                        tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, f"Critical error trying to add margin: {e}")
+
+            # --- TRADE OPENING LOGIC ---
+            if not is_bot_paused and not is_locked:
+                # CORRECTION: Uses the most recent peak price as reference
+                base_price_for_drop = last_peak_price
+                
+                if base_price_for_drop is None:
+                    time.sleep(5)
+                    continue
+
+                buy_trigger_price = base_price_for_drop - buy_drop_amount
+
+                if current_positions_count < max_positions and current_price <= buy_trigger_price:
+                    info_msg = f"Price reached trigger at ${buy_trigger_price:,.2f}. Trying to open new position..."
+                    log_message(info_msg, "INFO")
+                    tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, info_msg)
+
+                    with trade_attempt_lock:
+                        is_trade_attempt_locked = True
+
+                    # Calculate Take Profit price
+                    price_variation_for_profit = (tp_percentage / leverage) * current_price
+                    final_take_profit_price = round((current_price + price_variation_for_profit) * 2) / 2
+
+                    params = {"type": "m", "side": "b", "margin": buy_amount_sats, "leverage": leverage, 'takeprofit': final_take_profit_price}
+                    trade_data = get_api_data(lnm.futures_new_trade, params)
+
+                    if trade_data and trade_data.get('id'):
+                        last_buy_price = trade_data.get('price')
+                        
+                        # NEW LINE: Resets the peak to the last buy price
+                        last_peak_price = last_buy_price
+                        
+                        msg = (f"New Position Opened!\nID: {trade_data['id']}\nPrice: ${trade_data.get('price'):,.2f}\n"
+                               f"Margin: {buy_amount_sats:,} sats\nTake Profit: ${final_take_profit_price:,.2f}")
+                        log_message(msg, "SUCCESS")
+                        tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, msg)
+                    else:
+                        log_message(f"Failed to Open Position. API Response: {trade_data}", "ERROR")
+                        tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, f"Failed to Open Position. API Response: {trade_data}")
+
+                    threading.Timer(TRADE_ATTEMPT_COOLDOWN_SECONDS, reset_trade_lock).start()
+                    log_message(f"Trade attempt lock activated for {TRADE_ATTEMPT_COOLDOWN_SECONDS} seconds.", "INFO")
+
+            # Periodic log/status
+            if (time.time() - last_log_time) >= (log_interval * 60):
+                summary_msg = "Periodic Summary\n\n" + generate_summary_message_html()
+                log_message(summary_msg, "SUMMARY")
+                tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, summary_msg, reply_markup=build_main_keyboard())
+                last_log_time = time.time()
+
+            time.sleep(5)
+        except Exception as e:
+            log_message(f"Critical error in trading loop: {e}", "CRITICAL")
+            tg_send_message(DEFAULT_TELEGRAM_CHAT_ID, f"Critical error in trading loop: {e}")
+            time.sleep(60)
+
+# ----------------------------
+# 8. ENTRY POINT
+# ----------------------------
 if __name__ == "__main__":
-    run_bot()
+    try:
+        # Disable SSL warnings for easier setup (NOT RECOMMENDED FOR PRODUCTION)
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        ssl._create_default_https_context = ssl._create_unverified_context
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] Starting the bot...")
+
+        options = {"key": API_KEY, "secret": API_SECRET, "passphrase": PASSPHRASE, "network": NETWORK}
+        lnm = rest.LNMarketsRest(**options)
+
+        # Initial API check
+        if get_api_data(lnm.futures_get_ticker) is None:
+            raise ConnectionError("Could not connect or authenticate with the LN Markets API.")
+
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [SUCCESS] LN Markets authentication successful!")
+
+        # Start Telegram listener thread
+        t_listener = threading.Thread(target=tg_listener_thread, daemon=True)
+        t_listener.start()
+
+        # Start periodic status sender thread (optional)
+        t_periodic = threading.Thread(target=send_status_periodic, daemon=True)
+        t_periodic.start()
+
+        run_bot_trader()
+
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [CRITICAL] Critical initialization failure: {e}")
+        sys.exit(1)
